@@ -1,0 +1,240 @@
+#!/bin/bash
+# ccr — Claude/Codex 远程确认开关与工具
+set -u
+CCR_DIR="${CCR_DIR:-$HOME/.cc-remote}"
+# shellcheck source=../lib.sh
+source "$CCR_DIR/lib.sh"
+
+SELF=$(basename "$0")
+CCR_PLIST="$HOME/Library/LaunchAgents/cc-remote.daemon.plist"
+
+usage() {
+  cat <<'EOF'
+ccr — AI coding 远程确认/通知系统 (Claude Code + Codex)
+
+开关:
+  ccr dingtalk-notify on|off  远程确认: 需要确认时发钉钉(机器人@强提醒), 手机回复选项, AI按回复继续
+  ccr status                  查看开关/守护进程/hooks/通道状态
+  ccr set bwait N             修改远程确认权限等待秒数(默认480)
+  ccr set await N             修改 ccr ask 等待秒数(默认570)
+  ccr set inject on|off       开关: 引用「空闲」消息发的指令直接键入会话终端(默认on)
+
+提问(agent调用, 阻塞等待手机回复):
+  ccr ask "问题" --options "1=选项一,2=选项二" [--timeout 570]
+                        stdout: 回复原文 或 TIMEOUT; B未开时 exit 1
+
+通道与守护:
+  ccr setup             首次配置: 钉钉群/机器人识别+往返自测
+  ccr send "标题" "正文"  底层发送(调试用)
+  ccr test              端到端往返测试(会发真实钉钉消息)
+  ccr inbox             查看未被路由的自由文本消息
+  ccr daemon start|stop|ensure|status|log
+  ccr doctor            全面体检
+
+安装:
+  ccr install [--claude|--codex|--all]   装适配器(默认both)
+  ccr uninstall                           卸载适配器(保留~/.cc-remote)
+EOF
+}
+
+cmd_status() {
+  local b gid tok daemon_state hooks_state
+  b=$(ccr_cfg '.switch_b // false')
+  gid=$(ccr_cfg '.group_id // ""')
+  tok=$(ccr_cfg '.webhook_token // ""')
+  echo "远程确认(dingtalk-notify): $b  (权限等待 $(ccr_cfg '.perm_wait_seconds // 480')s)"
+  if [ -n "$gid" ] && [ "$gid" != "null" ]; then
+    local gtitle chan
+    gtitle=$(ccr_cfg '.group_title // ""')
+    [ "$gtitle" = "null" ] && gtitle=""
+    if [ -n "$tok" ] && [ "$tok" != "null" ]; then chan="webhook机器人"; else chan="用户身份"; fi
+    echo "钉钉通道: ${gtitle:-群}/${chan}"
+  else
+    echo "钉钉通道: 未配置 (运行 ccr setup)"
+  fi
+  local hb="$CCR_LOG_DIR/daemon.heartbeat"
+  if [ -f "$hb" ] && [ $(( $(date +%s) - $(stat -f %m "$hb") )) -le 180 ]; then daemon_state="运行中"; else daemon_state="未运行 (ccr daemon start)"; fi
+  echo "守护进程: $daemon_state"
+  if jq -e '.hooks // {} | to_entries | any(.value[]?.hooks[]?.command | contains("cc-remote"))' "$HOME/.claude/settings.json" >/dev/null 2>&1; then
+    hooks_state="已安装"
+  else
+    hooks_state="!! 缺失 (ccr install --claude)"
+  fi
+  echo "Claude hooks: $hooks_state"
+  if [ -d "$HOME/.codex" ]; then
+    if [ -e "$HOME/.codex/skills/askme" ]; then
+      echo "Codex skill: 已安装"
+    else
+      echo "Codex skill: !! 缺失 (ccr install --codex)"
+    fi
+  fi
+  local n=0 f
+  for f in "$CCR_PENDING"/*.json; do [ -e "$f" ] && n=$((n+1)); done
+  [ "$n" -gt 0 ] && echo "未决询问: $n 个"
+  return 0
+}
+
+cmd_ask() {
+  local question="" options="" timeout=""
+  question="$1"; shift || true
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --options) options="$2"; shift 2 ;;
+      --timeout) timeout="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  if [ "$(ccr_cfg '.switch_b // false')" != "true" ]; then
+    echo "ccr: 远程确认开关未开启 (ccr dingtalk-notify on)。请在终端直接提问。" >&2
+    exit 1
+  fi
+  timeout=${timeout:-$(ccr_cfg '.ask_wait_seconds // 570')}
+
+  local token proj opts_md text
+  token=$(ccr_new_token)
+  proj=$(basename "$PWD")
+  opts_md=""
+  if [ -n "$options" ]; then
+    opts_md="**选项**:
+
+"
+    local IFS=','
+    for opt in $options; do
+      opts_md="${opts_md}- ${opt%%=*} = ${opt#*=}
+
+"
+    done
+    opts_md="${opts_md}回复 \`${token} 数字\` 或 \`${token} 自由文本\`"
+  else
+    opts_md="回复 \`${token} 你的意见\`"
+  fi
+  # shellcheck disable=SC2016
+  text="## 待确认 ${token}
+
+**项目**: ${proj}
+
+${question}
+
+${opts_md}
+
+💡 **引用本条**回复数字/意见可免 token；不引用请带 token（如 \`${token} 1\`）"
+
+  ccr_mk_ticket "$token" "ask" "{\"question\": $(jq -Rn --arg v "$question" '$v'), \"options\": $(jq -Rn --arg v "$options" '$v')}"
+  if ! ccr_send "待确认 $token · $proj" "$text" "$token"; then
+    rm -f "$CCR_PENDING/$token.json"
+    echo "TIMEOUT" # 发送失败按超时处理, 让 agent 走安全默认
+    exit 0
+  fi
+
+  local reply
+  if reply=$(ccr_wait_reply "$token" "$timeout"); then
+    echo "$reply" | jq -r '.raw // empty'
+  else
+    ccr_send "已超时 $token" "\`${token}\` 等待超时(${timeout}s)，已在本地按安全默认处理。" >/dev/null 2>&1
+    echo "TIMEOUT"
+  fi
+  rm -f "$CCR_PENDING/$token.json" "$CCR_PENDING/$token.reply"
+}
+
+cmd_daemon() {
+  local act="${1:-status}"
+  case "$act" in
+    start)
+      launchctl bootstrap "gui/$(id -u)" "$CCR_PLIST" 2>/dev/null || launchctl load -w "$CCR_PLIST" 2>/dev/null
+      sleep 1; cmd_daemon status ;;
+    stop)
+      launchctl bootout "gui/$(id -u)/cc-remote.daemon" 2>/dev/null || launchctl unload -w "$CCR_PLIST" 2>/dev/null
+      pkill -f "cc-remote/daemon.py" 2>/dev/null
+      echo "已停止" ;;
+    ensure)
+      pgrep -f "cc-remote/daemon.py" >/dev/null 2>&1 || cmd_daemon start >/dev/null 2>&1
+      return 0 ;;
+    status)
+      local hb pid alive
+      hb="$CCR_LOG_DIR/daemon.heartbeat"
+      alive=false
+      [ -f "$hb" ] && [ $(( $(date +%s) - $(stat -f %m "$hb") )) -le 180 ] && alive=true
+      pid=$(pgrep -f "cc-remote/daemon.py" 2>/dev/null | head -1)
+      if $alive; then
+        echo "daemon: 运行中 (心跳新鲜${pid:+, pid $pid})"
+      else
+        echo "daemon: 未运行 (ccr daemon start)"
+      fi ;;
+    log) tail -n "${2:-50}" "$CCR_LOG_DIR/daemon.log" 2>/dev/null ;;
+  esac
+}
+
+cmd_setup() {
+  bash "$CCR_DIR/setup.sh" "$@"
+}
+
+cmd_doctor() {
+  local fail=0
+  echo "== dws =="
+  local dws
+  dws=$(ccr_cfg '.dws_path')
+  if [ -x "$dws" ]; then
+    echo "dws: $dws"
+    if "$dws" profile list --format json 2>/dev/null | jq -e '.profiles | length > 0' >/dev/null 2>&1; then
+      echo "登录: OK ($(ccr_cfg '.user_name'))"
+    else
+      echo "登录: !! 失效，请重新登录 dws"; fail=1
+    fi
+  else
+    echo "dws: !! 不存在 $dws"; fail=1
+  fi
+  echo "== 钉钉通道 =="
+  local gid tok
+  gid=$(ccr_cfg '.group_id // ""'); tok=$(ccr_cfg '.webhook_token // ""')
+  if [ -n "$gid" ] && [ "$gid" != "null" ]; then
+    echo "群: $(ccr_cfg '.group_title') ($([ -n "$tok" ] && [ "$tok" != "null" ] && echo webhook机器人 || echo 用户身份))"
+  else
+    echo "群: !! 未配置 (ccr setup)"; fail=1
+  fi
+  echo "== 守护/hooks =="
+  cmd_daemon status
+  cmd_status | grep -E "hooks|skill|Codex"
+  [ "$fail" -eq 0 ] && echo "体检结果: 通过" || echo "体检结果: 存在问题(见 !!)"
+  return $fail
+}
+
+cmd_install() { bash "$CCR_DIR/install.sh" "$@"; }
+
+cmd_uninstall() { bash "$CCR_DIR/install.sh" --uninstall "$@"; }
+
+main() {
+  [ $# -lt 1 ] && { usage; exit 0; }
+  local cmd="$1"; shift || true
+  case "$cmd" in
+    dingtalk-notify|b) [ "${1:-}" = "on" ] || [ "${1:-}" = "off" ] || { echo "用法: ccr dingtalk-notify on|off"; exit 1; }
+       [ "$1" = "on" ] && v=true || v=false
+       ccr_set '.switch_b' "$v" && echo "远程确认(dingtalk-notify): $1"
+       if [ "$v" = "true" ]; then cmd_daemon ensure || echo "(守护启动失败, 稍后运行 ccr daemon start)"; fi ;;
+    set)
+       case "${1:-}" in
+         bwait)  ccr_set '.perm_wait_seconds' "${2:-480}" && echo "权限等待: ${2:-480}s" ;;
+         await)  ccr_set '.ask_wait_seconds' "${2:-570}" && echo "ask等待: ${2:-570}s" ;;
+         inject)  if [ "${2:-}" = "on" ] || [ "${2:-}" = "off" ]; then
+                    ccr_set '.terminal_inject' "$([ "${2:-}" = "on" ] && echo true || echo false)" && echo "终端注入: ${2}"
+                  else echo "用法: ccr set inject on|off"; exit 1; fi ;;
+         webhook)  ccr_set '.webhook_token' "\"${2:-}\"" && echo "webhook token: ${2:-(空=本人身份发)}" ;;
+         websecret) ccr_set '.webhook_secret' "\"${2:-}\"" && echo "webhook 加签密钥: 已${2:+写入}${2:-清空}" ;;
+         *) echo "用法: ccr set bwait|await|inject|webhook|websecret 值"; exit 1 ;;
+       esac ;;
+    status)    cmd_status ;;
+    ask)       [ -z "${1:-}" ] && { echo "用法: ccr ask \"问题\" --options \"1=x,2=y\""; exit 1; }
+               cmd_ask "$@" ;;
+    send)      ccr_send "${1:?标题}" "${2:?正文}" && echo "已发送" ;;
+    test)      bash "$CCR_DIR/selftest.sh" ;;
+    setup)     cmd_setup "$@" ;;
+    daemon)    cmd_daemon "$@" ;;
+    inbox)     [ -s "$CCR_LOG_DIR/inbox.txt" ] && cat "$CCR_LOG_DIR/inbox.txt" || echo "inbox 为空" ;;
+    doctor)    cmd_doctor ;;
+    install)   cmd_install "$@" ;;
+    uninstall) cmd_uninstall "$@" ;;
+    -h|--help|help) usage ;;
+    *) echo "未知命令: $cmd (见 ccr help)"; exit 1 ;;
+  esac
+}
+
+main "$@"

@@ -1,0 +1,6 @@
+# 运行时私有数据(密钥/游标/未决询问/日志) 一律不进仓库
+config.json
+state.json
+pending/
+logs/
+*.log

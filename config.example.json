@@ -1,0 +1,18 @@
+{
+  "_comment": "cc-remote 配置模板。首次运行自动复制为 config.json；敏感字段由 ccr setup 填写，请勿提交真实值",
+  "switch_b": false,
+  "dws_path": "",
+  "user_id": "",
+  "user_name": "",
+  "group_id": "",
+  "group_title": "",
+  "webhook_token": "",
+  "webhook_secret": "",
+  "robot_code": "",
+  "bot_open_dingtalk_id": "",
+  "mode": "group",
+  "perm_wait_seconds": 480,
+  "ask_wait_seconds": 570,
+  "poll_interval": 15,
+  "terminal_inject": true
+}

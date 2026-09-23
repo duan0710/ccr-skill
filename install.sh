@@ -121,7 +121,7 @@ gen_plist() {
   <key>ProcessType</key><string>Background</string>
   <key>EnvironmentVariables</key>
   <dict>
-    <key>PATH</key><string>${HOME}/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin</string>
+    <key>PATH</key><string>${HOME}/.local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     <key>HOME</key><string>${HOME}</string>
   </dict>
   <key>StandardOutPath</key><string>${CCR_DIR}/logs/daemon-stdout.log</string>

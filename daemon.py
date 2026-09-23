@@ -26,6 +26,11 @@ STATE_PATH = os.path.join(CCR, "state.json")
 PENDING = os.path.join(CCR, "pending")
 INBOX = os.path.join(CCR, "logs", "inbox.txt")
 DAEMON_LOG = os.path.join(CCR, "logs", "daemon.log")
+# 会话注册表(UserPromptSubmit hook 写入): {sid, tty, cwd, last_seen}
+SESSIONS_DIR = os.path.join(CCR, "sessions")
+# 无头任务记录与并发锁
+TASKS_DIR = os.path.join(CCR, "tasks")
+TASK_LOCK = os.path.join(TASKS_DIR, ".lock")
 
 TOKEN_RE = re.compile(r"^([a-z0-9]{4})[\s,:，:：]*(.*)$")
 BARE_CHOICE_RE = re.compile(r"^(1|2|3|4|y|n|yes|no|是|否|allow|deny)$", re.IGNORECASE)
@@ -42,8 +47,8 @@ CHOICE_MAP = {"1": "1", "2": "2", "3": "3", "4": "4",
 # 群内远程执行 ccr 白名单命令(私人群+sender=本人才进入路由, 见 main)
 CCR_CMD_RE = re.compile(
     r"^ccr\s+(dingtalk-notify|b)\s+(on|off)$"
-    r"|^ccr\s+(status|inbox)$"
-    r"|^ccr\s+set\s+inject\s+(on|off)$"
+    r"|^ccr\s+(status|inbox|tasks)\s*$"
+    r"|^ccr\s+set\s+(inject|task)\s+(on|off)$"
     r"|^ccr\s+set\s+(bwait|await|webhook|websecret)\s+\S+$")
 
 
@@ -197,6 +202,99 @@ def write_reply(token, raw):
     data = {"raw": raw, "choice": choice, "at": int(time.time())}
     save_json(os.path.join(PENDING, "%s.reply" % token), data)
     log("reply %s <- %r (choice=%s)" % (token, raw, choice))
+
+
+def ensure_dirs():
+    for d in (PENDING, SESSIONS_DIR, TASKS_DIR):
+        try:
+            os.makedirs(d, exist_ok=True)
+        except OSError:
+            pass
+
+
+def active_session(max_age=600):
+    """注册表里最近活跃的会话(<=max_age 秒), 返回 dict 或 None
+
+    claude TUI 活跃时每轮 UserPromptSubmit 会刷新 last_seen; 超过 max_age
+    视为会话已停(终端关闭/崩溃)。
+    """
+    best, best_ts = None, -1
+    now = time.time()
+    try:
+        for name in os.listdir(SESSIONS_DIR):
+            if not name.endswith(".json"):
+                continue
+            meta = load_json(os.path.join(SESSIONS_DIR, name), {})
+            ts = meta.get("last_seen", 0)
+            if ts and now - ts <= max_age and ts > best_ts:
+                best, best_ts = meta, ts
+    except OSError:
+        pass
+    return best
+
+
+def run_headless_task(text, cfg):
+    """没有活跃会话时, 后台起 claude -p 执行新任务
+
+    - 单并发(TASK_LOCK), 超时 30min, 结果发回钉钉
+    - 权限链路沿用 settings.json 中的 PermissionRequest hook(理论上 -p 也会触发)
+    - 任务记录全文落 tasks/<ts>.log
+    """
+    if os.path.exists(TASK_LOCK):
+        return "busy", "已有无头任务在跑, 稍后再试"
+    ensure_dirs()
+    try:
+        with open(TASK_LOCK, "w") as f:
+            f.write(str(int(time.time())))
+    except OSError:
+        pass
+    log("headless task start: %r" % text[:200])
+    # 选 claude 二进制: 优先 PATH(nvm), 兜底常见安装位置
+    claude = shutil.which("claude") or os.path.expanduser("~/.nvm/versions/node")
+    if os.path.isdir(claude):
+        # ~/.nvm/versions/node/vX/bin/claude — 找最新版本
+        try:
+            for v in sorted(os.listdir(claude), reverse=True):
+                cand = os.path.join(claude, v, "bin", "claude")
+                if os.path.exists(cand):
+                    claude = cand
+                    break
+        except OSError:
+            pass
+    if not os.path.exists(claude):
+        os.remove(TASK_LOCK)
+        return "fail", "未找到 claude 二进制(需 nvm 装好并登录)"
+    # 权限模式: 远程确认开则 default(hook 会发钉钉), 否则 plan(只读最安全)
+    perm = "default" if cfg.get("switch_b") else "plan"
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_path = os.path.join(TASKS_DIR, ts + ".log")
+    try:
+        with open(log_path, "w") as lf:
+            lf.write(">>> %s\n\n" % text)
+            lf.flush()
+            p = subprocess.run([claude, "-p", "--permission-mode", perm, text],
+                               capture_output=True, text=True, timeout=1800,
+                               env=dict(os.environ, CI="1"))
+            out = (p.stdout or "") + (p.stderr or "")
+            lf.write("rc=%d\n%s\n" % (p.returncode, out))
+    except subprocess.TimeoutExpired:
+        with open(log_path, "a") as lf:
+            lf.write("\n(超时 30min, 已终止)\n")
+        return "timeout", "无头任务执行超 30min 已终止, 日志: tasks/%s.log" % ts
+    except Exception as e:
+        os.remove(TASK_LOCK)
+        log("headless task fail: %s" % e)
+        return "fail", str(e)
+    finally:
+        try:
+            os.remove(TASK_LOCK)
+        except OSError:
+            pass
+    # 结果 @回群(截断, 全文在 log)
+    snippet = out.strip()[:1500] or "(空输出)"
+    webhook_send(cfg, "ccr 无头任务完成", "## 任务: %s\n\n```\n%s\n```\n\n全文: `tasks/%s.log`"
+                 % (text[:80], snippet, ts))
+    return "ok", "无头任务完成, 全文见 tasks/%s.log" % ts
 
 
 def append_inbox(text):
@@ -365,10 +463,26 @@ def route(text, cfg):
                          "当前有 %d 个未决询问: %s\n\n请回复 `<token> 数字`，或**引用**对应消息直接回复。" % (len(pend), names))
             log("ambiguous bare choice, pendings=%s" % pend)
             return
+    # 有活跃会话(注册表最近10min刷新过): 直接注入, 不依赖"空闲等待"消息
+    sess = active_session()
+    if sess and sess.get("tty", "").startswith("ttys"):
+        if inject_to_tmux(body, sess["tty"].replace("/dev/", "")) or \
+           inject_to_terminal(body, sess["tty"].replace("/dev/", "")):
+            webhook_send(cfg, "ccr 已键入终端",
+                         "已把指令键入活跃会话终端(%s), 等同亲手输入:\n\n> %s"
+                         % (sess.get("cwd", "").split("/")[-1] or "claude", body))
+            log("injected to active session tty=%s" % sess.get("tty"))
+            return
     # 有空闲会话待命: 自由文本默认作为给它的指令, 直接键入其终端
     idle_t = newest_pending("idle")
     if idle_t:
         deliver_reply(idle_t, body, cfg)
+        return
+    # 无活跃会话且开启了无头任务: 后台起 claude -p 执行
+    if cfg.get("task_enabled"):
+        status, msg = run_headless_task(raw, cfg)
+        webhook_send(cfg, "ccr 任务状态", "%s\n\n%s" % (msg, raw[:200]))
+        log("headless task %s: %r" % (status, raw[:80]))
         return
     handle_free_text(raw, cfg)
 
@@ -396,6 +510,7 @@ def auth_alert_throttled(state):
 
 
 def main():
+    ensure_dirs()
     state = load_json(STATE_PATH, {})
     if not state.get("cursor"):
         state["cursor"] = now_str()  # 首次启动忽略历史消息

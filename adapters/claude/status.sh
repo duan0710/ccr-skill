@@ -1,7 +1,7 @@
 #!/bin/bash
-# Claude Code UserPromptSubmit hook: 每轮注入一行开关状态(纯文本, 不得以{开头)
-# 必须 <1s 完成: 只做一次 jq 读
-cat >/dev/null  # 丢弃 stdin JSON
+# Claude Code UserPromptSubmit hook: ①每轮注入一行开关状态 ②写会话注册表(忙碌注入/无头兜底用)
+# 总耗时须 <1s: 2 次 jq 读 + 1 次小文件写
+input=$(cat)
 
 CCR_DIR="${CCR_DIR:-$HOME/.cc-remote}"
 line=$(jq -r '"[cc-remote] 远程确认(dingtalk-notify)=\(.switch_b)"' "$CCR_DIR/config.json" 2>/dev/null)
@@ -9,4 +9,29 @@ if [ "$(jq -r '.switch_b // false' "$CCR_DIR/config.json" 2>/dev/null)" = "true"
   line="$line。需要用户决策/确认时: 不要用 AskUserQuestion、不要只在终端提问, 改为运行 Bash(ccr路径 ~/.cc-remote/bin/ccr): ~/.cc-remote/bin/ccr ask \"问题\" --options \"1=选项一,2=选项二\" (timeout 600000), stdout 即用户回复; 回复 TIMEOUT 则按安全默认继续并说明。尽量把多个小决策合并为一次询问。"
 fi
 [ -n "$line" ] && echo "$line"
+
+
+# ---- 会话注册表: session_id -> {tty, cwd, last_seen}, daemon 忙碌注入/无头兜底读 ----
+if [ -n "$input" ]; then
+  sid=$(printf '%s' "$input" | jq -r '.session_id // empty' 2>/dev/null)
+  if [ -n "$sid" ] && [ "$sid" != "null" ]; then
+    cwd_h=$(printf '%s' "$input" | jq -r '.cwd // empty' 2>/dev/null)
+    cwd_h="${cwd_h//\"/}"
+    ttys=$(ps -o tty= -p $$ 2>/dev/null | tr -d ' ')
+    if [ -z "$ttys" ] || [ "$ttys" = "??" ]; then
+      pp=$$
+      for _ in 1 2 3 4 5; do
+        pp=$(ps -o ppid= -p "$pp" 2>/dev/null | tr -d ' ')
+        [ -z "$pp" ] && break
+        ttys=$(ps -o tty= -p "$pp" 2>/dev/null | tr -d ' ')
+        if [ -n "$ttys" ] && [ "$ttys" != "??" ]; then break; fi
+      done
+    fi
+    mkdir -p "$CCR_DIR/sessions" 2>/dev/null
+    printf '{"session_id":"%s","tty":"%s","cwd":"%s","last_seen":%d}' \
+      "$sid" "$ttys" "$cwd_h" "$(date +%s)" \
+      > "$CCR_DIR/sessions/$sid.json" 2>/dev/null
+  fi
+fi
 exit 0
+

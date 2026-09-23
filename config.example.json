@@ -14,5 +14,6 @@
   "perm_wait_seconds": 480,
   "ask_wait_seconds": 570,
   "poll_interval": 15,
-  "terminal_inject": true
+  "terminal_inject": true,
+  "task_enabled": false
 }

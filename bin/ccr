@@ -18,6 +18,7 @@ ccr — AI coding 远程确认/通知系统 (Claude Code + Codex)
   ccr set bwait N             修改远程确认权限等待秒数(默认480)
   ccr set await N             修改 ccr ask 等待秒数(默认570)
   ccr set inject on|off       开关: 引用「空闲」消息发的指令直接键入会话终端(默认on)
+  ccr set task on|off         开关: 无活跃会话时, 手机指令后台起 claude -p 执行并回发结果(默认off)
 
 提问(agent调用, 阻塞等待手机回复):
   ccr ask "问题" --options "1=选项一,2=选项二" [--timeout 570]
@@ -120,6 +121,8 @@ ${opts_md}
 💡 **引用本条**回复数字/意见可免 token；不引用请带 token（如 \`${token} 1\`）"
 
   ccr_mk_ticket "$token" "ask" "{\"question\": $(jq -Rn --arg v "$question" '$v'), \"options\": $(jq -Rn --arg v "$options" '$v')}"
+  # 终端同步可见: 调用方(stdout 被 agent 读)与旁观者(stderr)都能看到在等什么
+  echo "[ccr] 已发钉钉确认: $question${options:+ · 选项: $options} (token $token, 回复 \`token 数字\` 或钉钉里回)" >&2
   if ! ccr_send "待确认 $token · $proj" "$text" "$token"; then
     rm -f "$CCR_PENDING/$token.json"
     echo "TIMEOUT" # 发送失败按超时处理, 让 agent 走安全默认
@@ -217,9 +220,12 @@ main() {
          inject)  if [ "${2:-}" = "on" ] || [ "${2:-}" = "off" ]; then
                     ccr_set '.terminal_inject' "$([ "${2:-}" = "on" ] && echo true || echo false)" && echo "终端注入: ${2}"
                   else echo "用法: ccr set inject on|off"; exit 1; fi ;;
+         task)    if [ "${2:-}" = "on" ] || [ "${2:-}" = "off" ]; then
+                    ccr_set '.task_enabled' "$([ "${2:-}" = "on" ] && echo true || echo false)" && echo "无头任务: ${2}"
+                  else echo "用法: ccr set task on|off"; exit 1; fi ;;
          webhook)  ccr_set '.webhook_token' "\"${2:-}\"" && echo "webhook token: ${2:-(空=本人身份发)}" ;;
          websecret) ccr_set '.webhook_secret' "\"${2:-}\"" && echo "webhook 加签密钥: 已${2:+写入}${2:-清空}" ;;
-         *) echo "用法: ccr set bwait|await|inject|webhook|websecret 值"; exit 1 ;;
+         *) echo "用法: ccr set bwait|await|inject|task|webhook|websecret 值"; exit 1 ;;
        esac ;;
     status)    cmd_status ;;
     ask)       [ -z "${1:-}" ] && { echo "用法: ccr ask \"问题\" --options \"1=x,2=y\""; exit 1; }

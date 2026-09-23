@@ -55,11 +55,13 @@ ${preview}
 text="${text}- ${auto_idx} ✅ 放行，并切 auto 模式（之后的权限提示自动处理）
 - ${deny_idx} ❌ 拒绝（可附原因：\`${token} ${deny_idx} 原因\`）
 
-💡 **引用本条**回复数字可免 token；不引用请带 token（如 \`${token} 1\`）"
+💡 超时前在电脑旁可直接放行: 终端运行 \`ccr reply ${token} 1\`
+**引用本条**回复数字可免 token；不引用请带 token（如 \`${token} 1\`）"
 
 # 本机桌面通知: 权限远程等待期间终端不显示提示, 屏幕上同步可见(引用/钉钉回复皆可)
 ccr_local_notify "权限确认 $token" "$tool · $proj — 钉钉回复数字放行, 或等超时本地弹窗"
 
+ccr_set_title "⏳ccr权限 $token · $tool"
 if ! ccr_send "权限确认 $token · $tool · $proj" "$text" "$token"; then
   rm -f "$CCR_PENDING/$token.json"
   exit 0   # 钉钉故障绝不卡权限流
@@ -110,4 +112,5 @@ case "$choice" in
     fi ;;
 esac
 rm -f "$CCR_PENDING/$token.json" "$CCR_PENDING/$token.reply"
+ccr_set_title ""
 exit 0

@@ -165,3 +165,18 @@ ccr_local_notify() {  # $1=标题(短) $2=正文
   body=$(printf '%s' "$2" | tr -d '"' | tr '\n' ' ' | cut -c1-220)
   /usr/bin/osascript -e "display notification \"$body\" with title \"ccr $title\" sound name \"default\"" >/dev/null 2>&1 || true
 }
+
+
+# 设置本终端窗口标题(等待确认期间实时可见, 不受 stdout 被管道接管影响)
+# $1=文本; 空文本=恢复(tmux 交还 automatic-rename, Terminal 清空标题)
+ccr_set_title() {
+  local text="$1"
+  if [ -n "${TMUX:-}" ] && command -v tmux >/dev/null 2>&1; then
+    if [ -n "$text" ]; then
+      tmux rename-window -- "$text" 2>/dev/null || true
+    else
+      tmux set-option -w automatic-rename on 2>/dev/null || true
+    fi
+  fi
+  printf '\033]0;%s\007' "$text" >/dev/tty 2>/dev/null || true
+}

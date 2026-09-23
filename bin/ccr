@@ -23,6 +23,7 @@ ccr — AI coding 远程确认/通知系统 (Claude Code + Codex)
 提问(agent调用, 阻塞等待手机回复):
   ccr ask "问题" --options "1=选项一,2=选项二" [--timeout 570]
                         stdout: 回复原文 或 TIMEOUT; B未开时 exit 1
+  ccr reply <token> 答案    本机作答钉钉里的确认(与钉钉回复等效, 在电脑旁用这个)
 
 通道与守护:
   ccr setup             首次配置: 钉钉群/机器人识别+往返自测
@@ -75,6 +76,35 @@ cmd_status() {
   return 0
 }
 
+# 本机作答: 与钉钉回复等效(写同一 reply 文件, 等待方立即解除)
+cmd_reply() {
+  local token="${1:-}" ; shift 2>/dev/null || true
+  local answer="${*:-}"
+  if [ -z "$token" ] || [ -z "$answer" ]; then
+    echo "用法: ccr reply <token> <答案/选项数字>" >&2
+    exit 1
+  fi
+  if [ ! -f "$CCR_PENDING/$token.json" ]; then
+    echo "ccr: token $token 不存在或已处理(未决: $(ls "$CCR_PENDING" 2>/dev/null | grep -c .json || echo 0) 个)" >&2
+    exit 1
+  fi
+  # 与 daemon write_reply 落盘格式一致: {raw, choice, at}
+  local choice
+  local norm
+  norm=$(printf '%s' "$answer" | awk '{print $1}' | tr '[:upper:]' '[:lower:]')
+  case "$norm" in
+    1|y|yes|是|allow|放行|同意|ok) choice="1" ;;
+    n|no|否|deny|拒绝|不同意) choice="deny" ;;
+    [1-4]) choice="$norm" ;;
+    第一项|选项一) choice="1" ;; 第二项|选项二) choice="2" ;;
+    第三项|选项三) choice="3" ;; 第四项|选项四) choice="4" ;;
+    *) choice="" ;;
+  esac
+  jq -n --arg raw "$answer" --arg choice "$choice" \
+    '{raw:$raw, choice:$choice, at:(now|floor)}' > "$CCR_PENDING/$token.reply"
+  echo "已作答 $token: $answer"
+}
+
 cmd_ask() {
   local question="" options="" timeout=""
   question="$1"; shift || true
@@ -118,13 +148,16 @@ ${question}
 
 ${opts_md}
 
-💡 **引用本条**回复数字/意见可免 token；不引用请带 token（如 \`${token} 1\`）"
+💡 电脑旁可本机直接作答: \`ccr reply ${token} 数字\`
+**引用本条**回复数字/意见可免 token；不引用请带 token（如 \`${token} 1\`）"
 
   ccr_mk_ticket "$token" "ask" "{\"question\": $(jq -Rn --arg v "$question" '$v'), \"options\": $(jq -Rn --arg v "$options" '$v')}"
   # 终端同步可见: 调用方(stdout 被 agent 读)与旁观者(stderr)都能看到在等什么
-  echo "[ccr] 已发钉钉确认: $question${options:+ · 选项: $options} (token $token, 回复 \`token 数字\` 或钉钉里回)" >&2
+  echo "[ccr] 已发钉钉确认: $question${options:+ · 选项: $options} (token $token, 在本机可答: ccr reply $token 数字; 或钉钉回复)" >&2
   # 本机桌面通知(平台无关): Codex TUI 不实时显示工具输出, 桌面通知是唯一可靠的本机可见通道
-  ccr_local_notify "待确认 $token" "$question${options:+ — 选项: $options}"
+  ccr_local_notify "待确认 $token" "$question${options:+ — 选项: $options} | 本机可答: ccr reply $token 数字"
+  # 终端窗口标题: 等待期间持续显示, 不依赖 stdout 通道
+  ccr_set_title "⏳ccr确认 $token"
   if ! ccr_send "待确认 $token · $proj" "$text" "$token"; then
     rm -f "$CCR_PENDING/$token.json"
     echo "TIMEOUT" # 发送失败按超时处理, 让 agent 走安全默认
@@ -138,6 +171,7 @@ ${opts_md}
     ccr_send "已超时 $token" "\`${token}\` 等待超时(${timeout}s)，已在本地按安全默认处理。" >/dev/null 2>&1
     echo "TIMEOUT"
   fi
+  ccr_set_title ""
   rm -f "$CCR_PENDING/$token.json" "$CCR_PENDING/$token.reply"
 }
 
@@ -232,6 +266,7 @@ main() {
     status)    cmd_status ;;
     ask)       [ -z "${1:-}" ] && { echo "用法: ccr ask \"问题\" --options \"1=x,2=y\""; exit 1; }
                cmd_ask "$@" ;;
+    reply)     cmd_reply "$@" ;;
     send)      ccr_send "${1:?标题}" "${2:?正文}" && echo "已发送" ;;
     test)      bash "$CCR_DIR/selftest.sh" ;;
     setup)     cmd_setup "$@" ;;

@@ -155,3 +155,13 @@ ccr_cleanup_tickets() {
     [ $(( $(date +%s) - created )) -gt "$max_age" ] && rm -f "$f"
   done
 }
+
+
+# 本机桌面通知(macOS): ccr ask/权限远程确认发出的同时, 本地屏幕同步可见
+# Codex TUI 不实时显示工具输出、Claude 终端也只是文本 —— 桌面通知不依赖任何工具渲染
+ccr_local_notify() {  # $1=标题(短) $2=正文
+  local title body
+  title=$(printf '%s' "$1" | tr -d '"\n' | cut -c1-60)
+  body=$(printf '%s' "$2" | tr -d '"' | tr '\n' ' ' | cut -c1-220)
+  /usr/bin/osascript -e "display notification \"$body\" with title \"ccr $title\" sound name \"default\"" >/dev/null 2>&1 || true
+}

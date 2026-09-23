@@ -123,6 +123,8 @@ ${opts_md}
   ccr_mk_ticket "$token" "ask" "{\"question\": $(jq -Rn --arg v "$question" '$v'), \"options\": $(jq -Rn --arg v "$options" '$v')}"
   # 终端同步可见: 调用方(stdout 被 agent 读)与旁观者(stderr)都能看到在等什么
   echo "[ccr] 已发钉钉确认: $question${options:+ · 选项: $options} (token $token, 回复 \`token 数字\` 或钉钉里回)" >&2
+  # 本机桌面通知(平台无关): Codex TUI 不实时显示工具输出, 桌面通知是唯一可靠的本机可见通道
+  ccr_local_notify "待确认 $token" "$question${options:+ — 选项: $options}"
   if ! ccr_send "待确认 $token · $proj" "$text" "$token"; then
     rm -f "$CCR_PENDING/$token.json"
     echo "TIMEOUT" # 发送失败按超时处理, 让 agent 走安全默认

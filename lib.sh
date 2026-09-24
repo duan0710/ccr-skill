@@ -178,5 +178,5 @@ ccr_set_title() {
       tmux set-option -w automatic-rename on 2>/dev/null || true
     fi
   fi
-  printf '\033]0;%s\007' "$text" >/dev/tty 2>/dev/null || true
+  { printf '\033]0;%s\007' "$text" > /dev/tty; } 2>/dev/null || true
 }

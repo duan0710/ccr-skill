@@ -166,13 +166,18 @@ ${opts_md}
 
   local reply
   if reply=$(ccr_wait_reply "$token" "$timeout"); then
-    echo "$reply" | jq -r '.raw // empty'
+    local ans
+    ans=$(echo "$reply" | jq -r '.raw // empty')
+    # 回执: 用户手机上立刻看到"指令已被 AI 接收"(与权限流的"已放行"对齐)
+    ccr_send "已接收 $token" "\`${token}\` **回复已接收**，AI 继续:\n\n> ${ans:0:120}" >/dev/null 2>&1 &
+    echo "$ans"
   else
     ccr_send "已超时 $token" "\`${token}\` 等待超时(${timeout}s)，已在本地按安全默认处理。" >/dev/null 2>&1
     echo "TIMEOUT"
   fi
   ccr_set_title ""
   rm -f "$CCR_PENDING/$token.json" "$CCR_PENDING/$token.reply"
+  wait 2>/dev/null
 }
 
 cmd_daemon() {

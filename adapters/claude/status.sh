@@ -27,9 +27,19 @@ if [ -n "$input" ]; then
         if [ -n "$ttys" ] && [ "$ttys" != "??" ]; then break; fi
       done
     fi
+    # claude 进程 pid: 沿父链找 comm 含 claude 的祖先(daemon 注入前校验 pid 仍持有该 tty)
+    pid_cur=$$
+    claud_pid=""
+    for _ in 1 2 3 4 5 6 7 8; do
+      pid_cur=$(ps -o ppid= -p "$pid_cur" 2>/dev/null | tr -d ' ')
+      [ -z "$pid_cur" ] || [ "$pid_cur" = "0" ] || [ "$pid_cur" = "1" ] && break
+      case "$(ps -o comm= -p "$pid_cur" 2>/dev/null)" in
+        *claude*) claud_pid="$pid_cur"; break ;;
+      esac
+    done
     mkdir -p "$CCR_DIR/sessions" 2>/dev/null
-    printf '{"session_id":"%s","tty":"%s","cwd":"%s","last_seen":%d}' \
-      "$sid" "$ttys" "$cwd_h" "$(date +%s)" \
+    printf '{"session_id":"%s","tty":"%s","cwd":"%s","pid":"%s","last_seen":%d}' \
+      "$sid" "$ttys" "$cwd_h" "$claud_pid" "$(date +%s)" \
       > "$CCR_DIR/sessions/$sid.json" 2>/dev/null
   fi
 fi

@@ -220,31 +220,99 @@ def tty_alive(tty):
     return os.path.exists(dev)
 
 
-def active_session(max_age=600, include_stale=False):
-    """注册表里最近活跃的会话；include_stale 时放宽到最近 24h(仍要求 tty 存活)
-
-    claude TUI 每轮 UserPromptSubmit 刷新 last_seen。远程注入不要求会话正活跃:
-    终端还开着、claude 还跑着(哪怕久无输入)照样能键入, 文本会排队待回合结束执行。
-    tty 不存在才真正排除(终端已关/重启后 ttysXXX 复用前先校验)。
-    """
-    best, best_ts = None, -1
-    now = time.time()
-    cap = 86400 if include_stale else max_age
+def pid_holds_tty(pid, tty):
+    """pid 存活且控制终端仍是注册的 tty(防重启后 ttys 编号复用打错窗口)"""
+    if not pid or not tty:
+        return False
     try:
-        for name in os.listdir(SESSIONS_DIR):
-            if not name.endswith(".json"):
-                continue
-            meta = load_json(os.path.join(SESSIONS_DIR, name), {})
-            ts = meta.get("last_seen", 0)
-            if not ts or now - ts > cap:
-                continue
-            if not tty_alive(meta.get("tty")):
-                continue
-            if ts > best_ts:
-                best, best_ts = meta, ts
+        out = subprocess.run(["/bin/ps", "-o", "tty=", "-p", str(pid)],
+                             capture_output=True, text=True, timeout=5)
+        cur = (out.stdout or "").strip().replace("/dev/", "")
+        return out.returncode == 0 and bool(cur) and cur == tty.replace("/dev/", "")
+    except Exception:
+        return False
+
+
+def session_valid(meta):
+    """会话可注入的真判据: claude pid 存活且仍持有该 tty, 且终端宿主是 Terminal.app/tmux
+
+    IDEA 内置终端虽跑着 claude 但无法注入(macOS 限制, 注入了也收不到), 直接判不可注入
+    """
+    tty = (meta.get("tty") or "").strip()
+    pid = str(meta.get("pid") or "").strip()
+    checked_pid = None
+    if pid:
+        if not pid_holds_tty(pid, tty):
+            return False
+        checked_pid = int(pid)
+    else:
+        if not tty.startswith("ttys"):
+            return False
+        try:  # 旧版条目无 pid: 取 tty 上任一 claude 进程做宿主校验
+            out = subprocess.run(["/bin/ps", "-o", "comm=,pid=", "-t", tty],
+                                 capture_output=True, text=True, timeout=5)
+            for ln in (out.stdout or "").splitlines():
+                if "claude" in ln:
+                    checked_pid = int(ln.split()[-1])
+                    break
+            if checked_pid is None:
+                return False
+        except Exception:
+            return False
+    return terminal_injectable(checked_pid)
+
+
+def terminal_injectable(pid):
+    """pid 的控制终端宿主是否 Terminal.app 或 tmux(可注入); IDEA 等返回 False"""
+    try:
+        # 沿父链向上找 GUI app / tmux: 每步查 comm
+        cur = int(pid)
+        for _ in range(10):
+            out = subprocess.run(["/bin/ps", "-o", "ppid=,comm=", "-p", str(cur)],
+                                 capture_output=True, text=True, timeout=5)
+            parts = (out.stdout or "").strip().split(None, 1)
+            if len(parts) != 2:
+                return False
+            ppid, comm = int(parts[0]), parts[1]
+            base = comm.rsplit("/", 1)[-1]
+            if base == "tmux" or "tmux" in comm:
+                return True
+            if base == "Terminal":  # /System/.../Terminal.app/Contents/MacOS/Terminal
+                return True
+            cur = ppid
+            if cur <= 1:
+                return False
+    except Exception:
+        return False
+    return False
+
+
+def active_sessions():
+    """按最近活跃排序返回所有**可注入**会话(无任何时间限制)
+
+    有效性只看进程归属: claude pid 活着且仍挂注册的 tty(闲置任意久都行)。
+    无效条目(pid 消失/tty 被新进程复用)当场删除 —— 注册表自洁不膨胀。
+    """
+    items = []
+    try:
+        names = os.listdir(SESSIONS_DIR)
     except OSError:
-        pass
-    return best
+        return items
+    for name in names:
+        if not name.endswith(".json"):
+            continue
+        path = os.path.join(SESSIONS_DIR, name)
+        meta = load_json(path, {})
+        if not session_valid(meta):
+            try:
+                os.remove(path)
+                log("session purge: %s tty=%s pid=%s" % (name[:16], meta.get("tty"), meta.get("pid")))
+            except OSError:
+                pass
+            continue
+        items.append(meta)
+    items.sort(key=lambda m: m.get("last_seen", 0), reverse=True)
+    return items
 
 
 def run_headless_task(text, cfg):
@@ -424,8 +492,9 @@ def deliver_reply(token, body, cfg):
 
 def handle_free_text(text, cfg):
     append_inbox(text)
-    ack = ("**未能送达 AI**（当前没有可注入的会话，无头任务未开启）— 已存 inbox，需**回电脑**处理: `ccr inbox`\n\n"
-           "要手机直接派活：①开着 claude/Terminal 会话再发 ②或回复 `ccr set task on` 开启无头执行")
+    n_sess = len(active_sessions())
+    ack = ("**未能送达 AI** — 已存 inbox，需**回电脑**处理: `ccr inbox`\n\n"
+           "当前可注入会话: %d 个。要手机直接派活：①在 Terminal.app/tmux 里开 claude 会话 ②或 `ccr set task on` 开无头执行" % n_sess)
     webhook_send(cfg, "ccr 未送达(存inbox)", "> %s\n\n%s" % (text, ack))
     log("free-text(未送达): %r" % text)
 
@@ -484,16 +553,14 @@ def route(text, cfg):
                          "当前有 %d 个未决询问: %s\n\n请回复 `<token> 数字`，或**引用**对应消息直接回复。" % (len(pend), names))
             log("ambiguous bare choice, pendings=%s" % pend)
             return
-    # 有可用会话(注册表最近24h且 tty 存活): 直接注入, 不要求会话正活跃、不依赖"空闲等待"消息
-    #   claude 忙碌时键入会排队等回合结束; 会话若真死了, tty 校验兜底
-    sess = active_session(include_stale=True)
-    if sess and sess.get("tty", "").startswith("ttys"):
-        if inject_to_tmux(body, sess["tty"].replace("/dev/", "")) or \
-           inject_to_terminal(body, sess["tty"].replace("/dev/", "")):
+    # 可注入会话(无时限, pid 归属校验): 新到旧逐个试(最新的可能是 IDEA 等注入不了的)
+    for sess in active_sessions():
+        tty = sess.get("tty", "").replace("/dev/", "")
+        if inject_to_tmux(body, tty) or inject_to_terminal(body, tty):
             webhook_send(cfg, "ccr 已键入终端",
-                         "已把指令键入活跃会话终端(%s), 等同亲手输入:\n\n> %s"
-                         % (sess.get("cwd", "").split("/")[-1] or "claude", body))
-            log("injected to active session tty=%s" % sess.get("tty"))
+                         "已把指令键入会话终端(**%s**), 等同亲手输入(Claude 忙则排队):\n\n> %s"
+                         % ((sess.get("cwd") or "claude").split("/")[-1], body))
+            log("injected to session tty=%s proj=%s" % (tty, (sess.get("cwd") or "")[-30:]))
             return
     # 有空闲会话待命: 自由文本默认作为给它的指令, 直接键入其终端
     idle_t = newest_pending("idle")

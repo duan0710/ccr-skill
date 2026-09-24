@@ -212,21 +212,35 @@ def ensure_dirs():
             pass
 
 
-def active_session(max_age=600):
-    """注册表里最近活跃的会话(<=max_age 秒), 返回 dict 或 None
+def tty_alive(tty):
+    """终端设备是否仍存在(关闭终端/tab 会释放 ttysXXX)"""
+    if not tty:
+        return False
+    dev = tty if tty.startswith("/dev/") else "/dev/%s" % tty
+    return os.path.exists(dev)
 
-    claude TUI 活跃时每轮 UserPromptSubmit 会刷新 last_seen; 超过 max_age
-    视为会话已停(终端关闭/崩溃)。
+
+def active_session(max_age=600, include_stale=False):
+    """注册表里最近活跃的会话；include_stale 时放宽到最近 24h(仍要求 tty 存活)
+
+    claude TUI 每轮 UserPromptSubmit 刷新 last_seen。远程注入不要求会话正活跃:
+    终端还开着、claude 还跑着(哪怕久无输入)照样能键入, 文本会排队待回合结束执行。
+    tty 不存在才真正排除(终端已关/重启后 ttysXXX 复用前先校验)。
     """
     best, best_ts = None, -1
     now = time.time()
+    cap = 86400 if include_stale else max_age
     try:
         for name in os.listdir(SESSIONS_DIR):
             if not name.endswith(".json"):
                 continue
             meta = load_json(os.path.join(SESSIONS_DIR, name), {})
             ts = meta.get("last_seen", 0)
-            if ts and now - ts <= max_age and ts > best_ts:
+            if not ts or now - ts > cap:
+                continue
+            if not tty_alive(meta.get("tty")):
+                continue
+            if ts > best_ts:
                 best, best_ts = meta, ts
     except OSError:
         pass
@@ -353,13 +367,20 @@ def inject_to_terminal(text, tty):
         'end tell\n'
         'return "miss"' % (tty, esc)
     )
-    try:
-        out = subprocess.run(["/usr/bin/osascript", "-e", script],
-                             capture_output=True, text=True, timeout=15)
-        return (out.stdout or "").strip() == "ok"
-    except Exception as e:
-        log("terminal inject fail: %s" % e)
-    return False
+    total = None
+    for attempt in (1, 2):  # AppleScript 写入偶发卡死(高负载/模态框), 重试一次
+        try:
+            out = subprocess.run(["/usr/bin/osascript", "-e", script],
+                                 capture_output=True, text=True, timeout=20)
+            total = (out.stdout or "").strip()
+            if total == "ok":
+                return True
+            log("terminal inject miss/err attempt %d: %r %r" % (attempt, total, (out.stderr or "")[:120]))
+            if total == "miss":
+                return False  # tty 不在 Terminal.app 窗口里(tmux/IDEA), 重试无意义
+        except Exception as e:
+            log("terminal inject fail attempt %d: %s" % (attempt, e))
+    return total == "ok"
 
 
 def dispatch_idle(body, meta, cfg):
@@ -403,10 +424,10 @@ def deliver_reply(token, body, cfg):
 
 def handle_free_text(text, cfg):
     append_inbox(text)
-    ack = ("已落 inbox。电脑上取回: `ccr inbox`\n\n"
-           "提示：AI 空闲时**引用**「空闲等待」消息发指令，可直接键入该会话终端执行（Terminal.app / tmux）。")
-    webhook_send(cfg, "ccr 已收到", "> %s\n\n%s" % (text, ack))
-    log("free-text: %r" % text)
+    ack = ("**未能送达 AI**（当前没有可注入的会话，无头任务未开启）— 已存 inbox，需**回电脑**处理: `ccr inbox`\n\n"
+           "要手机直接派活：①开着 claude/Terminal 会话再发 ②或回复 `ccr set task on` 开启无头执行")
+    webhook_send(cfg, "ccr 未送达(存inbox)", "> %s\n\n%s" % (text, ack))
+    log("free-text(未送达): %r" % text)
 
 
 # @提及剥离: 机器人名「AI Coding」含空格需整体匹配; 其他单词 @ 提及(如 @段凤)仅剥离不计为机器人
@@ -463,8 +484,9 @@ def route(text, cfg):
                          "当前有 %d 个未决询问: %s\n\n请回复 `<token> 数字`，或**引用**对应消息直接回复。" % (len(pend), names))
             log("ambiguous bare choice, pendings=%s" % pend)
             return
-    # 有活跃会话(注册表最近10min刷新过): 直接注入, 不依赖"空闲等待"消息
-    sess = active_session()
+    # 有可用会话(注册表最近24h且 tty 存活): 直接注入, 不要求会话正活跃、不依赖"空闲等待"消息
+    #   claude 忙碌时键入会排队等回合结束; 会话若真死了, tty 校验兜底
+    sess = active_session(include_stale=True)
     if sess and sess.get("tty", "").startswith("ttys"):
         if inject_to_tmux(body, sess["tty"].replace("/dev/", "")) or \
            inject_to_terminal(body, sess["tty"].replace("/dev/", "")):

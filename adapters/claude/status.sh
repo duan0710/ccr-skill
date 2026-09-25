@@ -37,10 +37,20 @@ if [ -n "$input" ]; then
         *claude*) claud_pid="$pid_cur"; break ;;
       esac
     done
+    # 会话别名(全生命周期稳定): 先确保已生成, 再 jq 合并刷新——别名绝不能被本轮重写丢掉
+    salias=$(ccr_alias_for_session "$sid")
     mkdir -p "$CCR_DIR/sessions" 2>/dev/null
-    printf '{"session_id":"%s","tty":"%s","cwd":"%s","pid":"%s","last_seen":%d}' \
-      "$sid" "$ttys" "$cwd_h" "$claud_pid" "$(date +%s)" \
-      > "$CCR_DIR/sessions/$sid.json" 2>/dev/null
+    f="$CCR_DIR/sessions/$sid.json"
+    tmp=$(mktemp "$CCR_DIR/sessions/.s.XXXXXX" 2>/dev/null)
+    if [ -n "$tmp" ] && jq --arg t "$ttys" --arg c "$cwd_h" --arg p "$claud_pid" --argjson ts "$(date +%s)" \
+        '.tty=$t|.cwd=$c|.pid=$p|.last_seen=$ts' "$f" >"$tmp" 2>/dev/null && [ -s "$tmp" ]; then
+      mv "$tmp" "$f" 2>/dev/null
+    else
+      [ -n "$tmp" ] && rm -f "$tmp"
+      printf '{"session_id":"%s","alias":"%s","tty":"%s","cwd":"%s","pid":"%s","last_seen":%d}' \
+        "$sid" "$salias" "$ttys" "$cwd_h" "$claud_pid" "$(date +%s)" \
+        > "$f" 2>/dev/null
+    fi
   fi
 fi
 exit 0

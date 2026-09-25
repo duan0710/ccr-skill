@@ -292,6 +292,7 @@ def active_sessions():
 
     有效性只看进程归属: claude pid 活着且仍挂注册的 tty(闲置任意久都行)。
     无效条目(pid 消失/tty 被新进程复用)当场删除 —— 注册表自洁不膨胀。
+    占位条目(仅别名, tty/pid 空, perm hook 早于 status hook 生成)保留但不可注入。
     """
     items = []
     try:
@@ -303,6 +304,9 @@ def active_sessions():
             continue
         path = os.path.join(SESSIONS_DIR, name)
         meta = load_json(path, {})
+        if not (meta.get("tty") or "").strip() and not (meta.get("pid") or "").strip():
+            items.append(meta)  # 占位(别名)条目: 不校验不删除
+            continue
         if not session_valid(meta):
             try:
                 os.remove(path)
@@ -525,6 +529,31 @@ def route(text, cfg):
     if m and os.path.exists(os.path.join(PENDING, "%s.json" % m.group(1))):
         deliver_reply(m.group(1), m.group(2).strip() or body, cfg)
         return
+    # 会话别名定向: "<别名> 指令" -> 键入该会话终端(未决 token 已优先命中, 不冲突)
+    words = body.split(None, 1)
+    if words and re.fullmatch(r"[a-z0-9]{4}", words[0]) and re.search(r"[a-z]", words[0]):
+        target = None
+        for meta in active_sessions():
+            if meta.get("alias") == words[0]:
+                target = meta
+                break
+        if target:
+            rest = words[1].strip() if len(words) > 1 else ""
+            proj = (target.get("cwd") or "claude").split("/")[-1]
+            if not rest:
+                webhook_send(cfg, "ccr 会话指令为空", "会话 **%s**（%s）在线。用法：`%s 指令内容`" % (words[0], proj, words[0]))
+                log("alias %s empty cmd" % words[0])
+                return
+            tty = (target.get("tty") or "").replace("/dev/", "")
+            if inject_to_tmux(rest, tty) or inject_to_terminal(rest, tty):
+                webhook_send(cfg, "ccr 已键入终端",
+                             "已把指令键入会话 **%s**（%s）终端，等同亲手输入（忙碌则排队）：\n\n> %s"
+                             % (words[0], proj, rest))
+            else:
+                webhook_send(cfg, "ccr 无法注入该终端",
+                             "会话 **%s**（%s）跑在 IDEA 内置终端或 tty 不可用，无法键入。" % (words[0], proj))
+            log("alias %s dispatch tty=%s" % (words[0], tty))
+            return
     if at_bot:
         # 引用回复: 数字=回答询问(优先 ask/perm), 文字=指令(优先空闲会话)
         if BARE_CHOICE_RE.match(body):
@@ -577,12 +606,16 @@ def route(text, cfg):
 
 
 def cleanup_pending(max_age=1800):
+    """过期票据回收: 普通(perm/ask)30 分钟; 空闲票据 7 天(其累积由 notify.sh 同会话去重控制)"""
     now = time.time()
+    idle_max_age = 7 * 86400
     try:
         for f in os.listdir(PENDING):
             p = os.path.join(PENDING, f)
             try:
-                if now - os.path.getmtime(p) > max_age:
+                limit = idle_max_age if (f.endswith(".json") and
+                                         load_json(p, {}).get("kind") == "idle") else max_age
+                if now - os.path.getmtime(p) > limit:
                     os.remove(p)
             except OSError:
                 pass

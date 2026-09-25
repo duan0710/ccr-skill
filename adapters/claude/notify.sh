@@ -41,13 +41,25 @@ ${msg}
           if [ -n "$ttys" ] && [ "$ttys" != "??" ]; then break; fi
         done
       fi
+      session=$(echo "$input" | jq -r '.session_id // empty' 2>/dev/null)
+      salias=$(ccr_alias_for_session "$session")
+      # 同会话旧空闲票据即时清理(空闲票据不再靠 30 分钟 GC, 靠本处去重防累积)
+      if [ -n "$session" ]; then
+        for f in "$CCR_PENDING"/*.json; do
+          [ -e "$f" ] || continue
+          if [ "$(jq -r '.kind // ""' "$f" 2>/dev/null)" = "idle" ] && [ "$(jq -r '.extra.session_id // ""' "$f" 2>/dev/null)" = "$session" ]; then
+            rm -f "$f" "${f%.json}.reply"
+          fi
+        done
+      fi
       token=$(ccr_new_token)
-      ccr_mk_ticket "$token" "idle" "{\"proj\": \"$proj\", \"tty\": \"${ttys}\"}"
-      ccr_send "空闲等待 · $proj" "## Claude $label ${token}
+      ccr_mk_ticket "$token" "idle" "{\"proj\": \"$proj\", \"tty\": \"${ttys}\", \"session_id\": \"$session\", \"alias\": \"$salias\"}"
+      ccr_send "空闲等待 · $proj${salias:+·$salias}" "## Claude $label ${token}
 
-**项目**: ${proj}
+**项目**: ${proj}${salias:+　**会话**: ${salias}}
 
-**引用本条**回复指令 → 直接键入该会话终端（Terminal.app / tmux），跟亲手打字一样。" >/dev/null 2>&1
+**引用本条**回复指令 → 直接键入该会话终端（Terminal.app / tmux），跟亲手打字一样。
+定向直达：发 \`${salias:-<别名>} 指令\` 可随时发往该会话（无需引用，忙碌时排队）。" >/dev/null 2>&1
     fi
     ;;
 esac

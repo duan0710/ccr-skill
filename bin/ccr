@@ -124,6 +124,26 @@ cmd_ask() {
   local token proj opts_md text
   token=$(ccr_new_token)
   proj=$(basename "$PWD")
+  # 会话别名: Bash 工具里拿不到 session_id, 沿父链找本终端 tty 与注册表对号
+  salias=""
+  ttys=$(ps -o tty= -p $$ 2>/dev/null | tr -d ' ')
+  if [ -z "$ttys" ] || [ "$ttys" = "??" ]; then
+    p=$$
+    for _ in 1 2 3 4 5; do
+      p=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')
+      [ -z "$p" ] && break
+      ttys=$(ps -o tty= -p "$p" 2>/dev/null | tr -d ' ')
+      if [ -n "$ttys" ] && [ "$ttys" != "??" ]; then break; fi
+    done
+  fi
+  if [ -n "$ttys" ] && [ "$ttys" != "??" ]; then
+    for f in "$CCR_DIR/sessions"/*.json; do
+      [ -e "$f" ] || continue
+      if [ "$(jq -r '.tty // ""' "$f" 2>/dev/null)" = "$ttys" ]; then
+        salias=$(jq -r '.alias // empty' "$f" 2>/dev/null); break
+      fi
+    done
+  fi
   opts_md=""
   if [ -n "$options" ]; then
     opts_md="**选项**:
@@ -142,7 +162,7 @@ cmd_ask() {
   # shellcheck disable=SC2016
   text="## 待确认 ${token}
 
-**项目**: ${proj}
+**项目**: ${proj}${salias:+　**会话**: ${salias}}
 
 ${question}
 

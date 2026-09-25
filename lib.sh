@@ -180,3 +180,33 @@ ccr_set_title() {
   fi
   { printf '\033]0;%s\007' "$text" > /dev/tty; } 2>/dev/null || true
 }
+
+# 会话别名: 4 位稳定标识, 会话全生命周期不变 —— 卡片上区分会话, 也是远程定向指令的地址
+# 用法: ccr_alias_for_session <session_id>; stdout 输出别名(无 session_id 时输出空)
+# 注册表 sessions/<sid>.json 由 status.sh 每轮刷新; 本函数读已有别名, 没有则生成并写回
+ccr_alias_for_session() {
+  local sid="$1" dir f al dup g tmp
+  [ -z "$sid" ] && return 0
+  dir="$CCR_DIR/sessions"; f="$dir/$sid.json"
+  al=$(jq -r '.alias // empty' "$f" 2>/dev/null)
+  if [ -z "$al" ] || [ "$al" = "null" ]; then
+    mkdir -p "$dir" 2>/dev/null
+    while :; do
+      al=$(LC_ALL=C tr -dc 'a-z0-9' </dev/urandom 2>/dev/null | head -c 4)
+      # 须含字母: 避免生成纯数字与回复选项数字混淆; 须与活跃会话唯一
+      [ ${#al} -eq 4 ] && printf '%s' "$al" | grep -q '[a-z]' || continue
+      dup=0
+      for g in "$dir"/*.json; do
+        [ -e "$g" ] || continue
+        [ "$(jq -r '.alias // empty' "$g" 2>/dev/null)" = "$al" ] && { dup=1; break; }
+      done
+      [ "$dup" = "0" ] && break
+    done
+    if [ -f "$f" ]; then
+      tmp=$(mktemp "$dir/.alias.XXXXXX") && jq --arg a "$al" '.alias=$a' "$f" >"$tmp" 2>/dev/null && mv "$tmp" "$f" 2>/dev/null
+    else
+      printf '{"session_id":"%s","alias":"%s","tty":"","cwd":"","pid":"","last_seen":%d}' "$sid" "$al" "$(date +%s)" >"$f" 2>/dev/null
+    fi
+  fi
+  echo "$al"
+}

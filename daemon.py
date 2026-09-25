@@ -506,10 +506,42 @@ def handle_free_text(text, cfg):
 # @提及剥离: 机器人名「AI Coding」含空格需整体匹配; 其他单词 @ 提及(如 @段凤)仅剥离不计为机器人
 MENTION_RE = re.compile(r"^(@AI\s*Coding(?:\s*机器人)?|@\S+)\s+")
 
+# 引用回复精确路由: 拉取接口的 quotedMessage.content 是被引用卡片完整正文
+# (2026-09-25 验证 dws chat message list 已返回该字段; 旧版无引用元数据只能按最新兜底)
+CARD_TOKEN_RES = [
+    re.compile(r"## 权限确认[^a-z0-9]*([a-z0-9]{4})(?![a-z0-9])"),
+    re.compile(r"## 待确认[^a-z0-9]*([a-z0-9]{4})(?![a-z0-9])"),
+    re.compile(r"## Claude[^\n]{0,40}?([a-z0-9]{4})(?![a-z0-9])"),
+    re.compile(r"(?:ccr reply|回复 `)\s*([a-z0-9]{4})"),
+]
 
-def route(text, cfg):
+
+def route_quoted(body, msg, cfg):
+    """引用了本系统卡片时的精确路由, 返回 True 表示已处理:
+
+    - 卡片票据未决 -> 回复路由到**该票据**(而非最新)
+    - 票据已结束(已处理/超时) -> 仅回执说明, 不做任何注入/兜底
+      (用户决策: 明确提示优于自作聪明的注入, 指定会话请显式用「别名 指令」)
+    """
+    q = (msg or {}).get("quotedMessage") or {}
+    qc = (q.get("content") or "").strip()
+    if not qc or SELF_MARKER not in qc:
+        return False
+    for rx in CARD_TOKEN_RES:
+        for tok in rx.findall(qc):
+            if os.path.exists(os.path.join(PENDING, tok + ".json")):
+                log("quote -> pending ticket %s" % tok)
+                deliver_reply(tok, body, cfg)
+                return True
+    webhook_send(cfg, "ccr 卡片已处理",
+                 "引用的卡片对应确认已结束（已处理或超时），本次输入未执行：\n\n> %s\n\n最新确认可直接回复数字（或引用最新卡片）；给指定会话发指令请用 `别名 指令`。" % body)
+    log("quote stale card, ignored")
+    return True
+
+
+def route(text, cfg, msg=None):
     raw = text.strip()
-    # 钉钉引用回复在消息拉取接口里没有引用元数据, 但会自动带 @机器人 前缀 —— 语义=回复最新询问
+    # 引用回复已能精确路由(quotedMessage 含被引用卡片全文); 手打 @机器人 仍按"回复最新询问"语义
     # 注意机器人名「AI Coding」本身含空格, 需整体匹配; 其他单词 @ 提及(如 @段凤)仅剥离不计为机器人
     at_bot, body = False, raw
     while True:
@@ -524,6 +556,9 @@ def route(text, cfg):
         return
     if CCR_CMD_RE.match(body):
         handle_ccr_command(body, cfg)
+        return
+    # 引用了本系统卡片: 精确路由(未决票据 > 卡上会话别名), 优先于 token/别名/最新兜底
+    if route_quoted(body, msg, cfg):
         return
     m = TOKEN_RE.match(body)
     if m and os.path.exists(os.path.join(PENDING, "%s.json" % m.group(1))):
@@ -679,7 +714,7 @@ def main():
                 continue
             log("user msg: %r" % content[:100])
             try:
-                route(content, cfg)
+                route(content, cfg, m)
             except Exception as e:
                 log("route error: %s" % e)
 

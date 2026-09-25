@@ -19,6 +19,10 @@ ccr — AI coding 远程确认/通知系统 (Claude Code + Codex)
   ccr set await N             修改 ccr ask 等待秒数(默认570)
   ccr set inject on|off       开关: 引用「空闲」消息发的指令直接键入会话终端(默认on)
   ccr set task on|off         开关: 无活跃会话时, 手机指令后台起 claude -p 执行并回发结果(默认off)
+  ccr start claude|codex [目录前缀] [首条指令]
+                              手机远程开新会话: Terminal 新窗口启动; 缺省 ~, 传前缀在项目根
+                              (有 ~/projects 用之, 否则 ~)下唯一匹配; 首条指令带入后即可
+                              「别名 指令」远程直达(claude; codex 无 hook 仅首条)
 
 提问(agent调用, 阻塞等待手机回复):
   ccr ask "问题" --options "1=选项一,2=选项二" [--timeout 570]
@@ -73,6 +77,13 @@ cmd_status() {
   local n=0 f
   for f in "$CCR_PENDING"/*.json; do [ -e "$f" ] && n=$((n+1)); done
   [ "$n" -gt 0 ] && echo "未决询问: $n 个"
+  # 会话别名清单: 远程「别名 指令」的地址簿
+  local al
+  for f in "$CCR_DIR/sessions"/*.json; do
+    [ -e "$f" ] || continue
+    al=$(jq -r '.alias // empty' "$f" 2>/dev/null)
+    [ -n "$al" ] && echo "会话 $al · $(jq -r '(.cwd // "") | split("/")[-1]' "$f" 2>/dev/null)"
+  done
   return 0
 }
 
@@ -200,6 +211,44 @@ ${opts_md}
   wait 2>/dev/null
 }
 
+cmd_start() {  # ccr start <claude|codex> [项目前缀] [首条指令...]
+  local which="${1:-}"; shift || true
+  case "$which" in claude|codex) ;; *) echo "用法: ccr start claude|codex [项目前缀] [首条指令...]"; exit 1 ;; esac
+  local proj="${1:-}"
+  [ -n "$proj" ] && shift || true
+  local prompt="$*"
+  # 项目目录: 不传前缀默认 ~ (通用, 不假定 projects 目录); 传前缀在根目录(~/projects 存在则用之, 否则 ~)下唯一匹配
+  local root="$HOME"; [ -d "$HOME/projects" ] && root="$HOME/projects"
+  local dir="$HOME" hits n
+  if [ -n "$proj" ]; then
+    hits=$(ls -d -- "$root/$proj"* 2>/dev/null)
+    n=$(printf '%s\n' "$hits" | grep -c .)
+    if [ "$n" = "1" ]; then
+      dir="$hits"
+    elif [ "$n" = "0" ]; then
+      echo "!! $root 下没有匹配 '$proj' 的目录, 现有:"; ls "$root"; exit 1
+    else
+      echo "!! '$proj' 匹配多个目录, 请给更长前缀:"; printf '%s\n' "$hits"; exit 1
+    fi
+  fi
+  # 组装 shell 命令(参数单引号包裹)与 AppleScript 转义(两级)
+  sq_cmd_arg() { printf '%s' "$1" | sed "s/'/'\\\\''/g"; }
+  local cmd="cd '$(sq_cmd_arg "$dir")' && $which"
+  [ -n "$prompt" ] && cmd="$cmd '$(sq_cmd_arg "$prompt")'"
+  if [ -n "${CCR_DRY_RUN:-}" ]; then echo "[dry-run] $cmd"; return 0; fi
+  local ap_esc=${cmd//\\/\\\\}; ap_esc=${ap_esc//\"/\\\"}
+  if /usr/bin/osascript -e "tell application \"Terminal\"
+    do script \"$ap_esc\"
+    activate
+  end tell" >/dev/null 2>&1; then
+    echo "已在 Terminal 新窗口启动 $which（$(basename "$dir")）"
+    [ -n "$prompt" ] && echo "首条指令已带入，会话注册后即可远程直达（别名见首张卡片或 ccr status）"
+    [ "$which" = "codex" ] && echo "注意: codex 无 hook，远程仅能带入这条首指令，后续交互需回电脑"
+  else
+    echo "!! 打开 Terminal 失败(屏幕共享/权限?)"; exit 1
+  fi
+}
+
 cmd_daemon() {
   local act="${1:-status}"
   case "$act" in
@@ -289,6 +338,7 @@ main() {
          *) echo "用法: ccr set bwait|await|inject|task|webhook|websecret 值"; exit 1 ;;
        esac ;;
     status)    cmd_status ;;
+    start)     cmd_start "$@" ;;
     ask)       [ -z "${1:-}" ] && { echo "用法: ccr ask \"问题\" --options \"1=x,2=y\""; exit 1; }
                cmd_ask "$@" ;;
     reply)     cmd_reply "$@" ;;

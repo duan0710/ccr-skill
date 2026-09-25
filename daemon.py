@@ -45,11 +45,13 @@ CHOICE_MAP = {"1": "1", "2": "2", "3": "3", "4": "4",
               "第三项": "3", "选项三": "3", "选择第三项": "3",
               "第四项": "4", "选项四": "4", "选择第四项": "4"}
 # 群内远程执行 ccr 白名单命令(私人群+sender=本人才进入路由, 见 main)
+# ccr start: 无活跃会话时手机开新 Terminal 会话(claude/codex), 余下任意文本=首条指令
 CCR_CMD_RE = re.compile(
     r"^ccr\s+(dingtalk-notify|b)\s+(on|off)$"
     r"|^ccr\s+(status|inbox|tasks)\s*$"
     r"|^ccr\s+set\s+(inject|task)\s+(on|off)$"
-    r"|^ccr\s+set\s+(bwait|await|webhook|websecret)\s+\S+$")
+    r"|^ccr\s+set\s+(bwait|await|webhook|websecret)\s+\S+$"
+    r"|^ccr\s+start\s+(claude|codex)(\s+\S.*)?$")
 
 
 def log(msg):
